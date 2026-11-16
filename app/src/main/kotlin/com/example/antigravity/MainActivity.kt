@@ -101,12 +101,16 @@ class MainActivity : ComponentActivity() {
 
         setupWebView()
 
-        // Dynamic session URL loading: load configured session URL or prompt user with sleek dark dialog
-        val savedUrl = getSavedSessionUrl()
-        if (!savedUrl.isNullOrBlank()) {
-            webView.loadUrl(savedUrl)
+        // Dynamic session URL loading: restore state or load configured session URL
+        if (savedInstanceState != null) {
+            webView.restoreState(savedInstanceState)
         } else {
-            showSessionConfigDialog(isFirstLaunch = true)
+            val savedUrl = getSavedSessionUrl()
+            if (!savedUrl.isNullOrBlank()) {
+                webView.loadUrl(savedUrl)
+            } else {
+                showSessionConfigDialog(isFirstLaunch = true)
+            }
         }
     }
 
@@ -341,6 +345,16 @@ class MainActivity : ComponentActivity() {
 
                 CookieManager.getInstance().flush()
 
+                // Persist current account/session URL so switching accounts (e.g. /u/1/, /u/2/) sticks permanently
+                url?.let { currentUrl ->
+                    if (currentUrl.startsWith("https://antigravity.google.com") &&
+                        !currentUrl.contains("/signin/") &&
+                        !currentUrl.contains("/oauth") &&
+                        !currentUrl.contains("accounts.google.com")) {
+                        saveSessionUrl(currentUrl)
+                    }
+                }
+
                 // Inject AGY chat panel auto-expansion script
                 view?.evaluateJavascript(
                     """
@@ -411,8 +425,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        webView.saveState(outState)
+    }
+
+    override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+        super.onRestoreInstanceState(savedInstanceState)
+        webView.restoreState(savedInstanceState)
+    }
+
     override fun onPause() {
         super.onPause()
+        webView.url?.let { currentUrl ->
+            if (currentUrl.startsWith("https://antigravity.google.com") &&
+                !currentUrl.contains("/signin/") &&
+                !currentUrl.contains("/oauth") &&
+                !currentUrl.contains("accounts.google.com")) {
+                saveSessionUrl(currentUrl)
+            }
+        }
         CookieManager.getInstance().flush()
     }
 
