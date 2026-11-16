@@ -17,7 +17,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 
@@ -33,7 +32,6 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var rootContainer: FrameLayout
     private lateinit var webView: WebView
-    private lateinit var progressBar: ProgressBar
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -70,28 +68,7 @@ class MainActivity : ComponentActivity() {
             setLayerType(View.LAYER_TYPE_HARDWARE, null)
         }
 
-        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(3)
-            )
-            max = 100
-            @Suppress("DEPRECATION")
-            progressDrawable?.setColorFilter(
-                Color.parseColor("#3B82F6"),
-                android.graphics.PorterDuff.Mode.SRC_IN
-            )
-            visibility = View.VISIBLE
-        }
-
-        // Long press on progress bar allows re-opening session URL config dialog
-        progressBar.setOnLongClickListener {
-            showSessionConfigDialog(isFirstLaunch = false)
-            true
-        }
-
         rootContainer.addView(webView)
-        rootContainer.addView(progressBar)
         setContentView(rootContainer)
 
         // Immersive fullscreen activation
@@ -336,12 +313,10 @@ class MainActivity : ComponentActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                progressBar.visibility = View.VISIBLE
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                progressBar.visibility = View.GONE
 
                 CookieManager.getInstance().flush()
 
@@ -398,7 +373,6 @@ class MainActivity : ComponentActivity() {
             ) {
                 super.onReceivedError(view, request, error)
                 if (request?.isForMainFrame == true) {
-                    progressBar.visibility = View.GONE
                     // Prompt user with config dialog if the remote URL could not be resolved or reached
                     showSessionConfigDialog(isFirstLaunch = false)
                 }
@@ -413,16 +387,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                if (newProgress < 100) {
-                    progressBar.visibility = View.VISIBLE
-                    progressBar.progress = newProgress
-                } else {
-                    progressBar.visibility = View.GONE
-                }
-            }
-        }
+        webView.webChromeClient = WebChromeClient()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
