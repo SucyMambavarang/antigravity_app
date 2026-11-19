@@ -169,7 +169,7 @@ class MainActivity : ComponentActivity() {
 
         // Subtitle / Instruction
         val subtitleView = TextView(context).apply {
-            text = "Paste your Antigravity remote agent session URL below, or start with the default portal template."
+            text = "Paste your Antigravity session URL below. Tip: Tap with 3 fingers on screen anytime to reopen this menu."
             textSize = 13f
             setTextColor(Color.parseColor("#94A3B8"))
             setPadding(0, dp(8), 0, dp(16))
@@ -208,7 +208,7 @@ class MainActivity : ComponentActivity() {
             text = "Use Default Template: antigravity.google.com"
             textSize = 12f
             setTextColor(Color.parseColor("#60A5FA"))
-            setPadding(0, dp(10), 0, dp(18))
+            setPadding(0, dp(10), 0, dp(14))
             isClickable = true
             isFocusable = true
             setOnClickListener {
@@ -217,6 +217,59 @@ class MainActivity : ComponentActivity() {
             }
         }
         card.addView(templateBtn)
+
+        // Account Switch & Reset Actions
+        val accountActions = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, dp(16))
+        }
+
+        val switchAccountBtn = TextView(context).apply {
+            text = "🔄 切换谷歌账号 (Switch Google Account)"
+            textSize = 13f
+            setTextColor(Color.parseColor("#38BDF8"))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            val btnBg = GradientDrawable().apply {
+                setColor(Color.parseColor("#0F172A"))
+                cornerRadius = 8 * density
+                setStroke((1 * density).toInt(), Color.parseColor("#0284C7"))
+            }
+            background = btnBg
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                dialog.dismiss()
+                val chooserUrl = "https://accounts.google.com/AccountChooser?continue=https://antigravity.google.com/"
+                saveSessionUrl(DEFAULT_TEMPLATE_URL)
+                webView.loadUrl(chooserUrl)
+                applyImmersiveFullScreen()
+            }
+        }
+        accountActions.addView(switchAccountBtn)
+
+        val clearSessionBtn = TextView(context).apply {
+            text = "🧹 清除登录凭证并退出 (Clear Session & Re-login)"
+            textSize = 12f
+            setTextColor(Color.parseColor("#F87171"))
+            setPadding(dp(4), dp(10), 0, dp(4))
+            isClickable = true
+            isFocusable = true
+            setOnClickListener {
+                dialog.dismiss()
+                CookieManager.getInstance().removeAllCookies {
+                    CookieManager.getInstance().flush()
+                    saveSessionUrl(DEFAULT_TEMPLATE_URL)
+                    runOnUiThread {
+                        webView.clearCache(true)
+                        webView.loadUrl("https://accounts.google.com/AccountChooser?continue=https://antigravity.google.com/")
+                        applyImmersiveFullScreen()
+                    }
+                }
+            }
+        }
+        accountActions.addView(clearSessionBtn)
+
+        card.addView(accountActions)
 
         // Action Buttons Row
         val buttonRow = LinearLayout(context).apply {
@@ -320,13 +373,19 @@ class MainActivity : ComponentActivity() {
 
                 CookieManager.getInstance().flush()
 
-                // Persist current account/session URL so switching accounts (e.g. /u/1/, /u/2/) sticks permanently
+                // Persist current account base portal (e.g. /u/1/ or /) without locking onto temporary dead /r/ sessions
                 url?.let { currentUrl ->
                     if (currentUrl.startsWith("https://antigravity.google.com") &&
                         !currentUrl.contains("/signin/") &&
                         !currentUrl.contains("/oauth") &&
                         !currentUrl.contains("accounts.google.com")) {
-                        saveSessionUrl(currentUrl)
+                        val baseAccountUrl = if (currentUrl.contains("/u/")) {
+                            val match = Regex("""(https://antigravity\.google\.com/u/\d+/)""").find(currentUrl)
+                            match?.value ?: DEFAULT_TEMPLATE_URL
+                        } else {
+                            DEFAULT_TEMPLATE_URL
+                        }
+                        saveSessionUrl(baseAccountUrl)
                     }
                 }
 
@@ -400,6 +459,15 @@ class MainActivity : ComponentActivity() {
         webView.restoreState(savedInstanceState)
     }
 
+    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean {
+        if (ev != null && ev.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+            if (ev.pointerCount >= 3) {
+                showSessionConfigDialog(isFirstLaunch = false)
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun onPause() {
         super.onPause()
         webView.url?.let { currentUrl ->
@@ -407,7 +475,13 @@ class MainActivity : ComponentActivity() {
                 !currentUrl.contains("/signin/") &&
                 !currentUrl.contains("/oauth") &&
                 !currentUrl.contains("accounts.google.com")) {
-                saveSessionUrl(currentUrl)
+                val baseAccountUrl = if (currentUrl.contains("/u/")) {
+                    val match = Regex("""(https://antigravity\.google\.com/u/\d+/)""").find(currentUrl)
+                    match?.value ?: DEFAULT_TEMPLATE_URL
+                } else {
+                    DEFAULT_TEMPLATE_URL
+                }
+                saveSessionUrl(baseAccountUrl)
             }
         }
         CookieManager.getInstance().flush()
