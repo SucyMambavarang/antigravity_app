@@ -1,24 +1,37 @@
 package com.example.antigravity
 
+import android.animation.Animator
+import android.animation.AnimatorSet
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.app.Dialog
 import android.content.Context
+import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
 import android.view.*
+import android.view.animation.AccelerateDecelerateInterpolator
 import android.webkit.*
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 
 class MainActivity : ComponentActivity() {
 
@@ -26,24 +39,81 @@ class MainActivity : ComponentActivity() {
         private const val PREFS_NAME = "antigravity_prefs"
         private const val KEY_SESSION_URL = "session_target_url"
         private const val DEFAULT_TEMPLATE_URL = "https://antigravity.google.com"
+        private const val SPLASH_FALLBACK_TIMEOUT_MS = 3500L
+        private const val SPLASH_FADE_DURATION_MS = 260L
         private const val CHROME_UA =
             "Mozilla/5.0 (Linux; Android 14; 25102RKBEC) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.107 Mobile Safari/537.36"
     }
 
     private lateinit var rootContainer: FrameLayout
     private lateinit var webView: WebView
+    private var splashOverlay: FrameLayout? = null
+    private var splashAnimators: MutableList<Animator> = mutableListOf()
+    private var splashDismissed = false
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val splashTimeoutRunnable = Runnable {
+        dismissSplashOverlay()
+    }
+
+    private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val callback = fileUploadCallback
+        fileUploadCallback = null
+        if (callback == null) return@registerForActivityResult
+
+        var uris: Array<Uri>? = null
+        try {
+            if (result.resultCode == Activity.RESULT_OK) {
+                val data = result.data
+                if (data != null) {
+                    val clipData = data.clipData
+                    if (clipData != null && clipData.itemCount > 0) {
+                        val uriList = ArrayList<Uri>(clipData.itemCount)
+                        for (i in 0 until clipData.itemCount) {
+                            clipData.getItemAt(i)?.uri?.let { uriList.add(it) }
+                        }
+                        if (uriList.isNotEmpty()) {
+                            uris = uriList.toTypedArray()
+                        }
+                    } else if (data.data != null) {
+                        uris = arrayOf(data.data!!)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            uris = null
+        }
+
+        try {
+            callback.onReceiveValue(uris)
+        } catch (_: Exception) {
+            // Ignore if WebView already detached
+        }
+    }
+
+    private fun isDarkMode(): Boolean {
+        val nightModeFlags = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
+        return nightModeFlags == Configuration.UI_MODE_NIGHT_YES
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 100% immersive fullscreen: zero status bar, zero nav bar, zero borders
+        val isDark = isDarkMode()
+        val adaptiveBgColor = if (isDark) Color.parseColor("#0F172A") else Color.parseColor("#FFFFFF")
+
+        // Adaptive status & navigation bar colors matching system light/dark mode
         @Suppress("DEPRECATION")
         run {
             window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS)
             window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
-            window.statusBarColor = Color.parseColor("#0F172A")
-            window.navigationBarColor = Color.parseColor("#0F172A")
+            window.statusBarColor = adaptiveBgColor
+            window.navigationBarColor = adaptiveBgColor
         }
 
         rootContainer = FrameLayout(this).apply {
@@ -51,7 +121,7 @@ class MainActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
-            setBackgroundColor(Color.parseColor("#0B0F19"))
+            setBackgroundColor(adaptiveBgColor)
             isFocusable = true
             isFocusableInTouchMode = true
         }
@@ -61,7 +131,7 @@ class MainActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
-            setBackgroundColor(Color.parseColor("#0B0F19"))
+            setBackgroundColor(adaptiveBgColor)
             isVerticalScrollBarEnabled = false
             isHorizontalScrollBarEnabled = false
             // Hardware acceleration
@@ -69,14 +139,23 @@ class MainActivity : ComponentActivity() {
         }
 
         rootContainer.addView(webView)
+
+        // Native smooth splash overlay on top of WebView to eliminate cold-start flash
+        val overlay = createSplashOverlay(isDark, adaptiveBgColor)
+        splashOverlay = overlay
+        rootContainer.addView(overlay)
+
         setContentView(rootContainer)
 
-        // Immersive fullscreen activation
+        // Immersive fullscreen + adaptive system bar icons activation
         window.decorView.post {
             applyImmersiveFullScreen()
         }
 
         setupWebView()
+
+        // Safety fallback timeout for splash dismissal (3.5s)
+        mainHandler.postDelayed(splashTimeoutRunnable, SPLASH_FALLBACK_TIMEOUT_MS)
 
         // Dynamic session URL loading: restore state or load configured session URL
         if (savedInstanceState != null) {
@@ -86,9 +165,196 @@ class MainActivity : ComponentActivity() {
             if (!savedUrl.isNullOrBlank()) {
                 webView.loadUrl(savedUrl)
             } else {
+                dismissSplashOverlay(immediate = true)
                 showSessionConfigDialog(isFirstLaunch = true)
             }
         }
+    }
+
+    private fun createSplashOverlay(isDark: Boolean, bgColor: Int): FrameLayout {
+        val density = resources.displayMetrics.density
+        val titleColor = if (isDark) Color.parseColor("#F8FAFC") else Color.parseColor("#0F172A")
+        val subtitleColor = if (isDark) Color.parseColor("#94A3B8") else Color.parseColor("#64748B")
+        val iconCardColor = if (isDark) Color.parseColor("#1E293B") else Color.parseColor("#FFFFFF")
+        val iconBorderColor = if (isDark) Color.parseColor("#334155") else Color.parseColor("#E2E8F0")
+        val dotColor = if (isDark) Color.parseColor("#60A5FA") else Color.parseColor("#3B82F6")
+
+        val overlay = FrameLayout(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            setBackgroundColor(bgColor)
+            isClickable = true
+            isFocusable = true
+        }
+
+        val centerColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER
+            )
+        }
+
+        // Icon container with soft elevation shadow & subtle breathing scale animation
+        val iconContainer = FrameLayout(this).apply {
+            val size = dp(82)
+            layoutParams = LinearLayout.LayoutParams(size, size).apply {
+                bottomMargin = dp(20)
+            }
+            background = GradientDrawable().apply {
+                setColor(iconCardColor)
+                cornerRadius = 22 * density
+                setStroke((1 * density).toInt().coerceAtLeast(1), iconBorderColor)
+            }
+            elevation = dp(10).toFloat()
+            clipToOutline = true
+        }
+
+        val iconView = ImageView(this).apply {
+            setImageResource(R.mipmap.ic_launcher)
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }
+        iconContainer.addView(iconView)
+        centerColumn.addView(iconContainer)
+
+        // Subtle breathing animation on icon container
+        val scaleXAnim = ObjectAnimator.ofFloat(iconContainer, View.SCALE_X, 0.96f, 1.04f).apply {
+            duration = 1350L
+            repeatCount = ValueAnimator.INFINITE
+            repeatMode = ValueAnimator.REVERSE
+            interpolator = AccelerateDecelerateInterpolator()
+        }
+        val scaleYAnim = ObjectAnimator.ofFloat(iconContainer, View.SCALE_Y, 0.96f, 1.04f).apply {
+            duration = 1350L
+            repeatCount = ValueAnimator.INFINITE
+            repeatMode = ValueAnimator.REVERSE
+            interpolator = AccelerateDecelerateInterpolator()
+        }
+        val iconBreathSet = AnimatorSet().apply {
+            playTogether(scaleXAnim, scaleYAnim)
+            start()
+        }
+        splashAnimators.add(iconBreathSet)
+
+        // Brand title
+        val brandTitle = TextView(this).apply {
+            text = "Antigravity"
+            textSize = 24f
+            letterSpacing = 0.04f
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            setTextColor(titleColor)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(6)
+            }
+        }
+        centerColumn.addView(brandTitle)
+
+        // Subtle minimalist subtitle
+        val subtitle = TextView(this).apply {
+            text = "Workspace"
+            textSize = 13f
+            letterSpacing = 0.08f
+            setTextColor(subtitleColor)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dp(22)
+            }
+        }
+        centerColumn.addView(subtitle)
+
+        // Minimalist 3-dot subtle loading indicator
+        val dotsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val dotSize = dp(6)
+        val dotMargin = dp(4)
+        for (i in 0 until 3) {
+            val dot = View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dotSize, dotSize).apply {
+                    marginStart = dotMargin
+                    marginEnd = dotMargin
+                }
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(dotColor)
+                }
+                alpha = 0.25f
+            }
+            dotsRow.addView(dot)
+
+            val dotAnim = ObjectAnimator.ofFloat(dot, View.ALPHA, 0.22f, 0.90f).apply {
+                duration = 650L
+                startDelay = i * 180L
+                repeatCount = ValueAnimator.INFINITE
+                repeatMode = ValueAnimator.REVERSE
+                interpolator = AccelerateDecelerateInterpolator()
+                start()
+            }
+            splashAnimators.add(dotAnim)
+        }
+        centerColumn.addView(dotsRow)
+
+        overlay.addView(centerColumn)
+        return overlay
+    }
+
+    private fun stopSplashAnimations() {
+        splashAnimators.forEach { animator ->
+            try {
+                animator.cancel()
+            } catch (_: Exception) {}
+        }
+        splashAnimators.clear()
+    }
+
+    private fun dismissSplashOverlay(immediate: Boolean = false) {
+        if (splashDismissed) return
+        splashDismissed = true
+        mainHandler.removeCallbacks(splashTimeoutRunnable)
+
+        val overlay = splashOverlay ?: return
+        if (overlay.visibility != View.VISIBLE) {
+            stopSplashAnimations()
+            return
+        }
+
+        if (immediate) {
+            stopSplashAnimations()
+            overlay.alpha = 0f
+            overlay.visibility = View.GONE
+            return
+        }
+
+        overlay.animate()
+            .alpha(0f)
+            .setDuration(SPLASH_FADE_DURATION_MS)
+            .setInterpolator(AccelerateDecelerateInterpolator())
+            .withEndAction {
+                stopSplashAnimations()
+                overlay.visibility = View.GONE
+            }
+            .start()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -102,16 +368,26 @@ class MainActivity : ComponentActivity() {
 
     private fun applyImmersiveFullScreen() {
         try {
+            val isDark = isDarkMode()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 window.setDecorFitsSystemWindows(false)
                 window.insetsController?.let { controller ->
+                    val appearance = if (isDark) 0 else (
+                        WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                            WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                        )
+                    controller.setSystemBarsAppearance(
+                        appearance,
+                        WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                            WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                    )
                     controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
                     controller.systemBarsBehavior =
                         WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 }
             } else {
                 @Suppress("DEPRECATION")
-                window.decorView.systemUiVisibility = (
+                var flags = (
                     View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                         or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                         or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
@@ -119,6 +395,16 @@ class MainActivity : ComponentActivity() {
                         or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                         or View.SYSTEM_UI_FLAG_FULLSCREEN
                     )
+                if (!isDark) {
+                    @Suppress("DEPRECATION")
+                    flags = flags or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        @Suppress("DEPRECATION")
+                        flags = flags or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+                    }
+                }
+                @Suppress("DEPRECATION")
+                window.decorView.systemUiVisibility = flags
             }
         } catch (_: Exception) {}
     }
@@ -352,7 +638,8 @@ class MainActivity : ComponentActivity() {
         settings.setSupportZoom(false)
         settings.builtInZoomControls = false
         settings.displayZoomControls = false
-        settings.allowFileAccess = false
+        settings.allowContentAccess = true
+        settings.allowFileAccess = true
         settings.setSupportMultipleWindows(false)
         settings.javaScriptCanOpenWindowsAutomatically = true
 
@@ -368,8 +655,14 @@ class MainActivity : ComponentActivity() {
                 super.onPageStarted(view, url, favicon)
             }
 
+            override fun onPageCommitVisible(view: WebView?, url: String?) {
+                super.onPageCommitVisible(view, url)
+                dismissSplashOverlay()
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                dismissSplashOverlay()
 
                 CookieManager.getInstance().flush()
 
@@ -432,6 +725,7 @@ class MainActivity : ComponentActivity() {
             ) {
                 super.onReceivedError(view, request, error)
                 if (request?.isForMainFrame == true) {
+                    dismissSplashOverlay()
                     // Prompt user with config dialog if the remote URL could not be resolved or reached
                     showSessionConfigDialog(isFirstLaunch = false)
                 }
@@ -446,7 +740,76 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        webView.webChromeClient = WebChromeClient()
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                // Always release any pending callback first to prevent <input type="file"> lockup
+                try {
+                    fileUploadCallback?.onReceiveValue(null)
+                } catch (_: Exception) {}
+                fileUploadCallback = filePathCallback
+
+                return try {
+                    val contentIntent = buildFileChooserIntent(fileChooserParams)
+                    val chooserTitle = fileChooserParams?.title?.toString()?.takeIf { it.isNotBlank() } ?: "选择文件"
+                    fileChooserLauncher.launch(Intent.createChooser(contentIntent, chooserTitle))
+                    true
+                } catch (_: Exception) {
+                    try {
+                        fileUploadCallback?.onReceiveValue(null)
+                    } catch (_: Exception) {}
+                    fileUploadCallback = null
+                    false
+                }
+            }
+        }
+    }
+
+    private fun buildFileChooserIntent(fileChooserParams: WebChromeClient.FileChooserParams?): Intent {
+        val rawAcceptTypes = fileChooserParams?.acceptTypes.orEmpty()
+        val resolvedMimeTypes = LinkedHashSet<String>()
+
+        for (raw in rawAcceptTypes) {
+            for (token in raw.split(",")) {
+                val trimmed = token.trim()
+                if (trimmed.isEmpty()) continue
+                if (trimmed == "*" || trimmed == "*/*") {
+                    resolvedMimeTypes.clear()
+                    resolvedMimeTypes.add("*/*")
+                    break
+                }
+                if (trimmed.startsWith(".")) {
+                    val ext = trimmed.removePrefix(".").lowercase()
+                    val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                    if (!mime.isNullOrBlank()) {
+                        resolvedMimeTypes.add(mime)
+                    }
+                } else if (trimmed.contains("/")) {
+                    resolvedMimeTypes.add(trimmed)
+                }
+            }
+            if (resolvedMimeTypes.contains("*/*")) break
+        }
+
+        return Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            when {
+                resolvedMimeTypes.isEmpty() || resolvedMimeTypes.contains("*/*") -> {
+                    type = "*/*"
+                }
+                resolvedMimeTypes.size == 1 -> {
+                    type = resolvedMimeTypes.first()
+                }
+                else -> {
+                    type = "*/*"
+                    putExtra(Intent.EXTRA_MIME_TYPES, resolvedMimeTypes.toTypedArray())
+                }
+            }
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -493,6 +856,12 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(splashTimeoutRunnable)
+        stopSplashAnimations()
+        try {
+            fileUploadCallback?.onReceiveValue(null)
+        } catch (_: Exception) {}
+        fileUploadCallback = null
         CookieManager.getInstance().flush()
         super.onDestroy()
     }
